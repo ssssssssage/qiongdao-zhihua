@@ -35,6 +35,17 @@ OUTPUT_DIR = PROJECT_DIR / "outputs"
 DATA_DIR = PROJECT_DIR / "data"
 POLICY_DIR = PROJECT_DIR / "policy"
 
+
+def get_config_value(name, default=""):
+    value = os.getenv(name)
+    if value:
+        return value
+    try:
+        secret_value = st.secrets.get(name, default)
+    except Exception:
+        secret_value = default
+    return str(secret_value).strip() if secret_value is not None else default
+
 DHM_IMG = OUTPUT_DIR / "dhm_result_clean.png"
 HLG_IMG = OUTPUT_DIR / "hlg_result_clean.png"
 DHM_SUMMARY = DATA_DIR / "dhm_summary.csv"
@@ -66,6 +77,33 @@ SCENE_FOCUS_TYPES = {
     "候鸟老人友好模式": {10, 11, 7, 8, 13},
     "年轻家庭模式": {9, 4, 7, 8, 2},
     "游客短租模式": {5, 12, 2, 13},
+}
+
+INSTANT_PLAN_CONFIG = {
+    "候鸟老人友好模式": {
+        "focus_types": {10, 11, 7, 8, 13},
+        "suggestions": [
+            "建议增设休息座椅",
+            "优化无障碍慢行路径",
+            "优先保障社区医疗可达",
+        ],
+    },
+    "年轻家庭模式": {
+        "focus_types": {9, 4, 8, 2},
+        "suggestions": [
+            "提升学校与居住组团联系",
+            "增加亲子活动空间",
+            "控制居住区周边交通干扰",
+        ],
+    },
+    "游客短租模式": {
+        "focus_types": {5, 12, 2, 13},
+        "suggestions": [
+            "强化公交接驳与景点联系",
+            "引导短租服务集中布局",
+            "夜间出行安全节点优化",
+        ],
+    },
 }
 
 RULE_PARSE_DEFAULTS = {
@@ -358,6 +396,40 @@ def draw_geojson_geometry(ax, geometry, color, is_focus):
             draw_geojson_point(ax, point, color, is_focus)
 
 
+def collect_geometry_points(geometry):
+    points = []
+
+    def walk(value):
+        if isinstance(value, (list, tuple)):
+            if len(value) >= 2 and all(isinstance(value[index], (int, float)) for index in [0, 1]):
+                points.append((float(value[0]), float(value[1])))
+            else:
+                for item in value:
+                    walk(item)
+
+    if isinstance(geometry, dict):
+        walk(geometry.get("coordinates"))
+    return points
+
+
+def get_feature_center(feature):
+    points = collect_geometry_points(feature.get("geometry") if isinstance(feature, dict) else None)
+    if not points:
+        return None
+    xs, ys = zip(*points)
+    return (sum(xs) / len(xs), sum(ys) / len(ys))
+
+
+def get_map_bounds(features):
+    points = []
+    for feature in features:
+        points.extend(collect_geometry_points(feature.get("geometry") if isinstance(feature, dict) else None))
+    if not points:
+        return None
+    xs, ys = zip(*points)
+    return min(xs), min(ys), max(xs), max(ys)
+
+
 def render_geojson_plan_figure(geojson_path, focus_types):
     if not MATPLOTLIB_AVAILABLE:
         raise RuntimeError("matplotlib is not installed")
@@ -394,6 +466,139 @@ def render_geojson_plan_figure(geojson_path, focus_types):
     ax.axis("off")
     fig.tight_layout(pad=0)
     return fig, len(features)
+
+
+def get_instant_plan_config(scene_name):
+    return INSTANT_PLAN_CONFIG.get(scene_name, INSTANT_PLAN_CONFIG["候鸟老人友好模式"])
+
+
+def render_instant_suggestion_cards(suggestions):
+    cards = []
+    for index, suggestion in enumerate(suggestions, start=1):
+        cards.append(
+            f"""
+<div class="instant-suggestion-card">
+  <div class="instant-suggestion-index">{index}</div>
+  <h4>{html.escape(suggestion)}</h4>
+  <p>图中编号 {index} 为该建议的示意标注位置。</p>
+</div>
+"""
+        )
+    st.markdown(
+        f"""
+<div class="instant-suggestion-grid">
+{''.join(cards)}
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+
+
+def get_focus_type_names(focus_type_ids):
+    names = []
+    for item in LAND_USE_LEGEND:
+        if item["编号"] in set(focus_type_ids):
+            names.append(f"type={item['编号']} {item['类型名称']}")
+    return names
+
+
+def render_instant_plan_report(scene_name, parse_result):
+    config = get_instant_plan_config(scene_name)
+    focus_names = get_focus_type_names(config["focus_types"])
+    suggestions_text = "\n".join([f"{index}. {item}" for index, item in enumerate(config["suggestions"], start=1)])
+    focus_text = "、".join(focus_names) if focus_names else "当前场景重点类型"
+    weights_text = (
+        f"医疗{parse_result['medical_weight']:.0%}、教育{parse_result['education_weight']:.0%}、"
+        f"商业{parse_result['commerce_weight']:.0%}、绿地{parse_result['green_weight']:.0%}、"
+        f"交通{parse_result['traffic_weight']:.0%}"
+    )
+    return f"""## 即时规划建议说明
+
+- 当前场景：{scene_name}
+- 指标权重参考：{weights_text}
+- 重点关注类型：{focus_text}
+
+### 三条即时建议
+
+{suggestions_text}
+
+真实性边界说明：该建议为展示端基于离线 GeoJSON 结果和当前场景的即时标注说明，用于解释用户需求下的优化方向；当前版本不进行现场 PPO/SGNN 训练，也不实时生成新的底层规划结果。"""
+
+
+def render_instant_plan_figure(geojson_path, scene_name, parse_result):
+    if not MATPLOTLIB_AVAILABLE:
+        raise RuntimeError("matplotlib is not installed")
+    if not geojson_path.exists() or geojson_path.stat().st_size == 0:
+        raise FileNotFoundError(str(geojson_path))
+
+    with open(geojson_path, "r", encoding="utf-8") as file:
+        geojson = json.load(file)
+
+    features = geojson.get("features", [])
+    if not isinstance(features, list) or not features:
+        raise ValueError("GeoJSON has no features")
+
+    instant_config = get_instant_plan_config(scene_name)
+    focus_types = set(instant_config["focus_types"])
+    fig, ax = plt.subplots(figsize=(5.2, 5.4), dpi=150)
+    fig.patch.set_facecolor("#fffdf8")
+    ax.set_facecolor("#fffdf8")
+
+    sorted_features = sorted(
+        features,
+        key=lambda feature: get_geojson_feature_type(feature) in focus_types,
+    )
+    for feature in sorted_features:
+        land_use_type = get_geojson_feature_type(feature)
+        if land_use_type is None:
+            continue
+        color = LAND_USE_COLOR_MAP.get(land_use_type, "#9ca3af")
+        is_focus = land_use_type in focus_types
+        draw_geojson_geometry(ax, feature.get("geometry"), color, is_focus)
+
+    bounds = get_map_bounds(features)
+    if bounds:
+        min_x, min_y, max_x, max_y = bounds
+        width = max(max_x - min_x, 1e-6)
+        height = max(max_y - min_y, 1e-6)
+        marker_positions = [
+            (min_x + width * 0.25, min_y + height * 0.76),
+            (min_x + width * 0.68, min_y + height * 0.54),
+            (min_x + width * 0.43, min_y + height * 0.24),
+        ]
+    else:
+        marker_positions = [(0, 0), (1, 1), (2, 0)]
+
+    marker_colors = ["#1b8fb8", "#18a99d", "#ff8f7a"]
+    for index, (x_value, y_value) in enumerate(marker_positions, start=1):
+        ax.scatter(
+            [x_value],
+            [y_value],
+            s=220,
+            color=marker_colors[index - 1],
+            edgecolors="#ffffff",
+            linewidths=1.8,
+            alpha=0.94,
+            zorder=30,
+        )
+        ax.text(
+            x_value,
+            y_value,
+            str(index),
+            color="#ffffff",
+            ha="center",
+            va="center",
+            fontsize=11,
+            fontweight="bold",
+            zorder=31,
+        )
+
+    ax.set_aspect("equal", adjustable="box")
+    ax.autoscale()
+    ax.margins(0.025)
+    ax.axis("off")
+    fig.tight_layout(pad=0.05)
+    return fig, instant_config
 
 
 def render_matplotlib_figure_png(fig):
@@ -447,9 +652,9 @@ def normalize_deepseek_result(raw_result, fallback):
 
 
 def call_deepseek_parser(user_text, selected_scene, fallback):
-    api_key = os.getenv("DEEPSEEK_API_KEY")
-    base_url = os.getenv("DEEPSEEK_BASE_URL", "https://api.sydney-ai.com/v1")
-    model = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+    api_key = get_config_value("DEEPSEEK_API_KEY")
+    base_url = get_config_value("DEEPSEEK_BASE_URL", "https://api.sydney-ai.com/v1")
+    model = get_config_value("DEEPSEEK_MODEL", "deepseek-chat")
     url = base_url.rstrip("/") + "/chat/completions"
     debug_info = {
         "是否读取到 DEEPSEEK_API_KEY": bool(api_key),
@@ -766,6 +971,13 @@ h2 {
     margin-bottom: 0.55rem;
 }
 
+.policy-evidence-meta {
+    color: #5f7285;
+    font-size: 0.88rem;
+    line-height: 1.55;
+    margin: 0.12rem 0;
+}
+
 .policy-evidence-label {
     color: #0f5d73;
     font-size: 0.82rem;
@@ -1002,6 +1214,55 @@ h2 {
     height: auto;
     display: block;
     border-radius: 14px;
+}
+
+.instant-suggestion-grid {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 0.85rem;
+    margin: 0.8rem 0 0.55rem;
+}
+
+.instant-suggestion-card {
+    min-height: 104px;
+    padding: 0.88rem 0.95rem;
+    border-radius: 16px;
+    background: #fffdf8;
+    border: 1px solid #d6eef2;
+    box-shadow: 0 8px 18px rgba(31, 53, 82, 0.05);
+}
+
+.instant-suggestion-index {
+    display: inline-flex;
+    width: 1.65rem;
+    height: 1.65rem;
+    align-items: center;
+    justify-content: center;
+    border-radius: 999px;
+    color: #ffffff;
+    background: linear-gradient(135deg, #1b8fb8, #18a99d);
+    font-weight: 800;
+    margin-bottom: 0.48rem;
+}
+
+.instant-suggestion-card h4 {
+    color: #16324f;
+    margin: 0;
+    font-size: 0.98rem;
+    line-height: 1.45;
+}
+
+.instant-suggestion-card p {
+    color: #61758a;
+    margin: 0.35rem 0 0;
+    font-size: 0.88rem;
+    line-height: 1.55;
+}
+
+@media (max-width: 900px) {
+    .instant-suggestion-grid {
+        grid-template-columns: 1fr;
+    }
 }
 
 .tech-flow-grid {
@@ -1634,7 +1895,7 @@ if summary_path.exists():
     except Exception as e:
         summary_error = str(e)
 
-result_tab_image, result_tab_geojson, result_tab_table, result_tab_chart = st.tabs(["规划结果图", "动态GeoJSON图", "空间统计表", "数值指标图"])
+result_tab_image, result_tab_geojson, result_tab_instant, result_tab_table, result_tab_chart = st.tabs(["规划结果图", "动态GeoJSON图", "即时建议图", "空间统计表", "数值指标图"])
 
 with result_tab_image:
     with st.container(border=True):
@@ -1691,6 +1952,33 @@ with result_tab_geojson:
         st.caption("type 含义来自上游 DRL urban planning 项目的 `city_config.py`。当前页面图片为展示端基于 GeoJSON `type` 字段生成的可视化结果，颜色采用展示端渲染配色。")
         st.markdown(render_land_use_legend_html(focus_types, include_focus=True), unsafe_allow_html=True)
         st.caption("注：颜色为展示端渲染配色，土地类型含义以上游 `city_config.py` 的 `type` 定义为准。其中 `type=4` 表示**居住用地**，`type=7`、`type=8` 表示**绿地类用地**。")
+
+with result_tab_instant:
+    with st.container(border=True):
+        st.markdown("### 即时规划建议图")
+        st.caption("该图为展示端基于离线 GeoJSON 和当前场景生成的即时标注图，图中编号对应下方三条建议。")
+
+        try:
+            instant_fig, instant_config = render_instant_plan_figure(geojson_path, final_scene, parse_result)
+            instant_image = render_matplotlib_figure_png(instant_fig)
+            render_centered_image(instant_image, caption=f"{final_scene} - 即时规划建议图", width=560)
+            if MATPLOTLIB_AVAILABLE:
+                plt.close(instant_fig)
+
+            st.download_button(
+                "下载即时建议图 PNG",
+                data=instant_image,
+                file_name=f"琼岛智划_{final_scene}_即时建议图.png",
+                mime="image/png",
+            )
+
+            focus_type_names = "、".join(get_focus_type_names(instant_config["focus_types"]))
+            st.caption(f"重点关注类型：{focus_type_names}")
+            render_instant_suggestion_cards(instant_config["suggestions"])
+            st.caption("该图为基于离线 GeoJSON 的即时场景化标注图，用于解释用户需求下的优化方向；当前版本不进行现场 PPO/SGNN 训练，也不实时生成新的底层规划结果。")
+        except Exception as e:
+            st.warning("暂时无法生成即时建议图，当前仍可查看静态规划结果图和动态 GeoJSON 图。")
+            st.caption(f"GeoJSON 路径：{geojson_path}｜错误原因：{e}")
 
 with result_tab_table:
     with st.container(border=True):
@@ -1938,9 +2226,9 @@ def render_agent_content(agent_data):
 
 def generate_agent_logs(user_text, parse_result):
     fallback_logs = build_rule_agent_logs(user_text, parse_result)
-    api_key = os.getenv("DEEPSEEK_API_KEY")
-    base_url = os.getenv("DEEPSEEK_BASE_URL", "https://api.sydney-ai.com/v1")
-    model = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+    api_key = get_config_value("DEEPSEEK_API_KEY")
+    base_url = get_config_value("DEEPSEEK_BASE_URL", "https://api.sydney-ai.com/v1")
+    model = get_config_value("DEEPSEEK_MODEL", "deepseek-chat")
     if not api_key:
         return fallback_logs
 
@@ -2057,6 +2345,61 @@ def split_policy_text(content, chunk_size=520):
     return chunks
 
 
+def extract_policy_field(block, field_name):
+    pattern = rf"【{re.escape(field_name)}】\s*([\s\S]*?)(?=\n【[^】]+】|\Z)"
+    match = re.search(pattern, block)
+    return clean_policy_text(match.group(1)) if match else ""
+
+
+def parse_policy_records(content, source_file):
+    blocks = [
+        block.strip()
+        for block in re.split(r"\n\s*\n(?=【政策名称】)", content)
+        if "【政策名称】" in block
+    ]
+    records = []
+
+    for block in blocks:
+        policy_name = extract_policy_field(block, "政策名称")
+        issuer = extract_policy_field(block, "发布机构")
+        year_or_date = extract_policy_field(block, "年份/实施时间") or extract_policy_field(block, "实施时间")
+        applicable_scene = extract_policy_field(block, "适用场景")
+        snippet = extract_policy_field(block, "政策片段") or clean_policy_text(block)
+        support_direction = extract_policy_field(block, "支撑方向")
+        if policy_name and snippet:
+            records.append(
+                {
+                    "policy_name": policy_name,
+                    "issuer": issuer or "未注明发布机构",
+                    "year_or_date": year_or_date or "未注明时间",
+                    "applicable_scene": applicable_scene,
+                    "snippet": snippet,
+                    "support_direction": support_direction or "可作为当前方案合规解释的辅助依据。",
+                    "source_file": source_file,
+                    "full_text": clean_policy_text(block),
+                }
+            )
+
+    if records:
+        return records
+
+    fallback_records = []
+    for chunk in split_policy_text(content):
+        fallback_records.append(
+            {
+                "policy_name": Path(source_file).stem,
+                "issuer": "演示政策摘要",
+                "year_or_date": "未注明时间",
+                "applicable_scene": "",
+                "snippet": clean_policy_text(chunk),
+                "support_direction": "该摘要片段可作为当前方案合规解释的辅助依据。",
+                "source_file": source_file,
+                "full_text": clean_policy_text(chunk),
+            }
+        )
+    return fallback_records
+
+
 def collect_agent_text(agent_logs):
     parts = []
     for agent_key, _ in AGENT_ORDER:
@@ -2119,8 +2462,18 @@ def retrieve_policy_chunks(user_text, parse_result, agent_logs, top_k=5):
 
     scored_chunks = []
     for doc in documents:
-        for chunk in split_policy_text(doc["content"]):
-            searchable = f"{doc['source']} {chunk}"
+        for record in parse_policy_records(doc["content"], doc["source"]):
+            searchable = " ".join(
+                [
+                    record["source_file"],
+                    record["policy_name"],
+                    record["issuer"],
+                    record["year_or_date"],
+                    record["applicable_scene"],
+                    record["snippet"],
+                    record["support_direction"],
+                ]
+            )
             score = 0
             chunk_matched_keywords = []
             for keyword in keywords:
@@ -2130,12 +2483,17 @@ def retrieve_policy_chunks(user_text, parse_result, agent_logs, top_k=5):
                     chunk_matched_keywords.append(keyword)
             if score > 0:
                 unique_keywords = list(dict.fromkeys(chunk_matched_keywords))
-                snippet = build_policy_snippet(chunk, unique_keywords)
+                snippet = build_policy_snippet(record["snippet"], unique_keywords)
                 scored_chunks.append(
                     {
-                        "source": doc["source"],
+                        "policy_name": record["policy_name"],
+                        "issuer": record["issuer"],
+                        "year_or_date": record["year_or_date"],
+                        "source_file": record["source_file"],
+                        "source": record["source_file"],
                         "snippet": snippet,
                         "matched_keywords": unique_keywords,
+                        "support_direction": record["support_direction"],
                         "relevance_reason": build_policy_relevance_reason(scenario, unique_keywords),
                         "score": score,
                     }
@@ -2228,17 +2586,24 @@ def get_policy_evidence(policy_sections):
 def render_policy_evidence_markdown(policy_sections):
     evidence_items = get_policy_evidence(policy_sections)
     if not evidence_items:
-        return "### 政策证据链\n\n当前未检索到明确政策片段，系统使用规则模板生成合规解释。"
+        return "## 政策证据链\n\n当前未检索到明确政策片段，系统使用规则模板生成合规解释。"
 
-    blocks = ["### 政策证据链"]
+    blocks = ["## 政策证据链"]
     for index, item in enumerate(evidence_items[:5], start=1):
         keywords = "、".join(item.get("matched_keywords", [])[:8]) or "无明确关键词"
+        policy_name = item.get("policy_name") or item.get("source") or "未知政策"
+        issuer = item.get("issuer", "未注明发布机构")
+        year_or_date = item.get("year_or_date", "未注明时间")
+        source_file = item.get("source_file") or item.get("source", "未知来源文件")
         blocks.append(
-            f"""#### 证据 {index}：{item.get('source', '未知政策来源')}
+            f"""#### 政策{index}：{policy_name}
 
+- 发布机构：{issuer}
+- 时间：{year_or_date}
+- 来源文件：{source_file}
 - 命中关键词：{keywords}
 - 命中片段：{item.get('snippet', '未检索到明确片段')}
-- 支撑建议：{item.get('relevance_reason', '该政策片段可作为当前方案合规解释的辅助依据。')}"""
+- 支撑方向：{item.get('support_direction', '该政策片段可作为当前方案合规解释的辅助依据。')}"""
         )
     return "\n\n".join(blocks)
 
@@ -2259,9 +2624,12 @@ def render_policy_evidence_cards(policy_sections):
 
     cards = []
     for item in evidence_items[:5]:
-        source = html.escape(str(item.get("source", "未知政策来源")))
+        policy_name = html.escape(str(item.get("policy_name") or item.get("source") or "未知政策"))
+        issuer = html.escape(str(item.get("issuer", "未注明发布机构")))
+        year_or_date = html.escape(str(item.get("year_or_date", "未注明时间")))
+        source_file = html.escape(str(item.get("source_file") or item.get("source", "未知来源文件")))
         snippet = html.escape(str(item.get("snippet", "未检索到明确片段")))
-        reason = html.escape(str(item.get("relevance_reason", "该政策片段可作为当前方案合规解释的辅助依据。")))
+        support_direction = html.escape(str(item.get("support_direction", "该政策片段可作为当前方案合规解释的辅助依据。")))
         keywords = item.get("matched_keywords", [])
         if not isinstance(keywords, list):
             keywords = []
@@ -2271,13 +2639,15 @@ def render_policy_evidence_cards(policy_sections):
         cards.append(
             f"""
 <div class="policy-evidence-card">
-  <div class="policy-evidence-source">政策来源：{source}</div>
+  <div class="policy-evidence-source">{policy_name}</div>
+  <p class="policy-evidence-meta">发布机构 / 年份：{issuer} / {year_or_date}</p>
+  <p class="policy-evidence-meta">来源文件：{source_file}</p>
   <div class="policy-evidence-label">命中关键词</div>
   <div class="policy-keyword-badges">{keyword_badges}</div>
   <div class="policy-evidence-label">命中片段</div>
   <p class="policy-evidence-snippet">{snippet}</p>
-  <div class="policy-evidence-label">支撑本方案的说明</div>
-  <p class="policy-evidence-reason">{reason}</p>
+  <div class="policy-evidence-label">支撑本方案的方向</div>
+  <p class="policy-evidence-reason">{support_direction}</p>
 </div>
 """
         )
@@ -2339,9 +2709,9 @@ def generate_policy_explanation(user_text, parse_result, agent_logs):
     retrieved_sources = sorted({item["source"] for item in retrieved_chunks})
     fallback_policy["sources"] = retrieved_sources
     fallback_policy["policy_evidence"] = retrieved_chunks
-    api_key = os.getenv("DEEPSEEK_API_KEY")
-    base_url = os.getenv("DEEPSEEK_BASE_URL", "https://api.sydney-ai.com/v1")
-    model = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+    api_key = get_config_value("DEEPSEEK_API_KEY")
+    base_url = get_config_value("DEEPSEEK_BASE_URL", "https://api.sydney-ai.com/v1")
+    model = get_config_value("DEEPSEEK_MODEL", "deepseek-chat")
     if not api_key or not retrieved_chunks:
         return fallback_policy
 
@@ -2353,7 +2723,7 @@ def generate_policy_explanation(user_text, parse_result, agent_logs):
     weights = {field: parse_result[field] for field in WEIGHT_FIELDS}
     policy_context = "\n\n".join(
         [
-            f"来源：{item['source']}｜相关度：{item['score']}｜命中关键词：{'、'.join(item.get('matched_keywords', []))}\n{item['snippet']}\n支撑说明：{item['relevance_reason']}"
+            f"政策名称：{item.get('policy_name', '未知政策')}｜发布机构：{item.get('issuer', '未注明发布机构')}｜时间：{item.get('year_or_date', '未注明时间')}｜来源文件：{item.get('source_file', item.get('source', '未知来源'))}｜相关度：{item['score']}｜命中关键词：{'、'.join(item.get('matched_keywords', []))}\n{item['snippet']}\n支撑方向：{item.get('support_direction', item.get('relevance_reason', '该政策片段可作为当前方案合规解释的辅助依据。'))}"
             for item in retrieved_chunks
         ]
     )
@@ -2416,13 +2786,19 @@ AI识别结果：{json.dumps(parse_result, ensure_ascii=False)}
 policy_sections = generate_policy_explanation(user_input, parse_result, agent_logs)
 policy_explanation = render_policy_markdown(policy_sections)
 
-if policy_sections.get("sources"):
-    source_count = len(policy_sections["sources"])
-    source_items = "".join([f"<li>{html.escape(source)}</li>" for source in policy_sections["sources"]])
+policy_evidence_items = get_policy_evidence(policy_sections)
+if policy_evidence_items:
+    source_count = len(policy_evidence_items)
+    source_items = "".join(
+        [
+            f"<li>{html.escape(str(item.get('policy_name', '未知政策')))}｜{html.escape(str(item.get('issuer', '未注明发布机构')))}｜{html.escape(str(item.get('year_or_date', '未注明时间')))}</li>"
+            for item in policy_evidence_items[:5]
+        ]
+    )
     st.markdown(
         f"""
 <div class="policy-source-card">
-  <strong>已检索到 {source_count} 个相关政策来源</strong>
+  <strong>已检索到 {source_count} 条结构化政策证据</strong>
   <ul>{source_items}</ul>
 </div>
 """,
@@ -2519,8 +2895,16 @@ def render_agent_report(agent_logs):
 
 def render_policy_report(policy_sections, user_text, parse_result, agent_logs):
     fallback_policy = build_rule_policy_explanation(user_text, parse_result, agent_logs)
+    evidence_items = get_policy_evidence(policy_sections if isinstance(policy_sections, dict) else {})
     sources = policy_sections.get("sources", []) if isinstance(policy_sections, dict) else []
-    if sources:
+    if evidence_items:
+        source_text = "\n".join(
+            [
+                f"- {safe_report_text(item.get('policy_name'), '未知政策')}｜{safe_report_text(item.get('issuer'), '未注明发布机构')}｜{safe_report_text(item.get('year_or_date'), '未注明时间')}"
+                for item in evidence_items[:5]
+            ]
+        )
+    elif sources:
         source_text = "\n".join([f"- {safe_report_text(source, '未知政策来源')}" for source in sources])
     else:
         source_text = "未检索到明确政策来源，系统使用内置规则模板生成政策解释。"
@@ -2585,6 +2969,7 @@ def build_report():
     report_agent_logs = get_report_agent_logs(agent_logs, user_input, parse_result)
     logs_text = render_agent_report(report_agent_logs)
     policy_text = render_policy_report(policy_sections, user_input, parse_result, report_agent_logs)
+    instant_plan_text = render_instant_plan_report(report_scene, parse_result)
     risks, suggestions = get_integrated_risks_and_suggestions(report_scene)
     risks_text = "\n".join([f"{index}. {item}" for index, item in enumerate(risks, start=1)])
     suggestions_text = "\n".join([f"{index}. {item}" for index, item in enumerate(suggestions, start=1)])
@@ -2642,6 +3027,8 @@ type 含义来自上游 DRL urban planning 项目的 `city_config.py`。当前�
 {legend_report_text}
 
 注：颜色为展示端渲染配色，土地类型含义以上游 `city_config.py` 的 `type` 定义为准。其中 `type=4` 表示**居住用地**，`type=7`、`type=8` 表示**绿地类用地**。
+
+{instant_plan_text}
 
 ## 六、离线规划引擎 + 在线智能解释（PPO-GNN/SGNN离线规划流程说明）
 

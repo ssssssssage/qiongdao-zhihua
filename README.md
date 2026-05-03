@@ -18,7 +18,7 @@
 
 - **离线算法层**：参考上游 DRL urban planning 项目，包含 PPO、SGNN/GNN 状态编码、规划环境、奖励函数和离线规划结果。上游结果通过 GeoJSON、PNG 和 CSV 进入展示端。
 - **在线交互层**：基于 Streamlit 页面，支持自然语言输入、候鸟老人友好模式、年轻家庭模式、游客短租模式三类场景选择，以及规划结果可视化浏览。
-- **智能解释层**：使用 DeepSeek/规则兜底进行需求解析，结合多Agent解释模块和轻量级本地政策 RAG，生成政策证据链、合规解释和多方诉求协调建议。
+- **智能解释层**：使用 DeepSeek/规则兜底进行需求解析，结合多Agent解释模块和轻量级本地政策 RAG，生成包含政策名称、发布机构、年份/时间、命中片段和支撑方向的政策证据链、合规解释和多方诉求协调建议。
 - **成果输出层**：展示静态规划图、动态 GeoJSON 渲染、空间统计表，并支持 Markdown / Word 规划分析报告导出。
 
 ## 4. 核心功能
@@ -63,7 +63,7 @@ D:\琼岛智划_project
 - `app/`：存放 Streamlit 展示端主程序。
 - `data/`：存放离线 GeoJSON 和空间统计 CSV。
 - `outputs/`：存放静态规划结果 PNG。
-- `policy/`：存放参赛演示用政策摘要，用于轻量级 RAG 检索，不代表完整政策原文。
+- `policy/`：存放参赛演示用政策摘要和政策来源索引，用于轻量级 RAG 检索；证据链会展示政策名称、发布机构、年份/时间、命中片段和支撑方向，但不代表完整政策原文。
 - `docs/`：存放审计报告、说明材料等文档。
 - `engine_original/`：用于保留或说明上游算法项目相关材料。
 - `generate_assets.py`：用于离线派生展示图和统计表的脚本。
@@ -135,7 +135,7 @@ python -m streamlit run app\streamlit_app.py --server.port 8502
 - DeepSeek、多Agent、RAG 用于在线解释、合规辅助和报告生成。
 - 海南自贸港和三亚场景属于展示端场景化适配。
 - 上游算法结果通过离线 GeoJSON、PNG 和 CSV 形式进入展示端。
-- `policy` 目录为参赛演示用政策摘要知识库，不代表完整政策原文。
+- `policy` 目录为参赛演示用政策摘要知识库和来源索引，不代表完整政策原文；若无法确定精确条号，系统仅使用“相关要求/政策摘要”表达，不编造法规条号。
 
 ## 12. 后续优化方向
 
@@ -150,3 +150,37 @@ python -m streamlit run app\streamlit_app.py --server.port 8502
 本作品当前采用 Web App 原型实现，可在电脑浏览器、平板和手机浏览器中访问。当前版本重点展示移动应用的核心交互流程，包括自然语言需求输入、场景识别、规划结果展示、动态 GeoJSON 渲染、多Agent解释、政策证据链和报告导出。
 
 后续可通过 Android WebView 或 PWA 方式封装为移动端 App。当前版本不声称已经是完整原生 Android / iOS App。
+
+## Streamlit Cloud 部署说明
+
+本项目可部署到 Streamlit Community Cloud，入口文件为：
+
+```text
+app/streamlit_app.py
+```
+
+部署步骤：
+
+1. 进入 Streamlit Community Cloud。
+2. 选择 GitHub 仓库 `qiongdao-zhihua`。
+3. Branch 填写：
+
+```text
+main
+```
+
+4. Main file path 填写：
+
+```text
+app/streamlit_app.py
+```
+
+5. 在 Advanced settings / Secrets 中填写：
+
+```toml
+DEEPSEEK_API_KEY = "你的APIKey"
+DEEPSEEK_BASE_URL = "https://api.sydney-ai.com/v1"
+DEEPSEEK_MODEL = "deepseek-chat"
+```
+
+注意：不要在 GitHub 仓库、README、代码或截图中写入真实 API Key。若未配置 DeepSeek Key，系统仍可通过规则解析兜底运行。
