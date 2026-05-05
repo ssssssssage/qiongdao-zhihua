@@ -3,6 +3,7 @@ import json
 import html
 import os
 import re
+import sys
 from io import BytesIO
 from urllib import error, request
 
@@ -31,6 +32,9 @@ except ImportError:
     MATPLOTLIB_AVAILABLE = False
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
+if str(PROJECT_DIR) not in sys.path:
+    sys.path.insert(0, str(PROJECT_DIR))
+
 OUTPUT_DIR = PROJECT_DIR / "outputs"
 DATA_DIR = PROJECT_DIR / "data"
 POLICY_DIR = PROJECT_DIR / "policy"
@@ -44,6 +48,7 @@ try:
 except Exception as e:
     POLICY_SYNC_AVAILABLE = False
     POLICY_SYNC_IMPORT_ERROR = str(e)
+    print(f"Policy sync module unavailable: {POLICY_SYNC_IMPORT_ERROR}")
 
 
 def get_config_value(name, default=""):
@@ -145,7 +150,7 @@ def get_policy_cache_status():
             "updated_at": "",
             "records": [],
             "sources": [],
-            "last_error": f"政策同步模块暂不可用：{POLICY_SYNC_IMPORT_ERROR}",
+            "last_error": "",
         }
     cache = load_policy_cache(POLICY_CACHE_PATH)
     sources = load_policy_sources(POLICY_SOURCES_PATH)
@@ -155,18 +160,21 @@ def get_policy_cache_status():
 
 
 def render_policy_sync_status():
-    st.markdown("## 官方政策源准实时更新")
-    with st.expander("官方政策源更新状态 / 可刷新政策证据库", expanded=False):
-        st.caption("用于补充政策证据链的公开页面准实时同步；当前仅作为参赛演示和规划解释辅助。")
+    with st.expander("政策证据链状态 / 可刷新政策摘要库", expanded=False):
+        st.caption("系统基于本地政策摘要库进行检索，并支持手动刷新官方公开政策源。当前功能用于规划解释辅助，不替代正式政策审查。")
+        st.caption("当前政策库为参赛演示用政策摘要库，可后续升级为官方政策源自动同步。")
 
         cache = get_policy_cache_status()
         records = cache.get("records", []) if isinstance(cache, dict) else []
         sources = cache.get("sources", []) if isinstance(cache, dict) else []
         updated_at = cache.get("updated_at", "") if isinstance(cache, dict) else ""
 
-        metric_cols = st.columns(2)
-        metric_cols[0].metric("当前政策缓存条数", len(records))
-        metric_cols[1].metric("最近更新时间", updated_at or "暂无缓存")
+        if records:
+            metric_cols = st.columns(2)
+            metric_cols[0].metric("当前政策缓存条数", len(records))
+            metric_cols[1].metric("最近更新时间", updated_at or "原文信息待补充")
+        else:
+            st.caption("当前使用参赛演示政策摘要库，可手动刷新官方公开政策源。")
 
         if sources:
             st.markdown("**政策源列表**")
@@ -183,7 +191,7 @@ def render_policy_sync_status():
 
         if st.button("刷新政策库", type="secondary", use_container_width=True):
             if not POLICY_SYNC_AVAILABLE:
-                st.warning("政策同步模块暂不可用，已使用本地缓存或 policy 文件夹。")
+                st.info("当前使用本地政策摘要库。")
             else:
                 result = sync_policy_sources(POLICY_SOURCES_PATH, POLICY_CACHE_PATH, timeout=10)
                 if result.get("ok"):
@@ -193,13 +201,11 @@ def render_policy_sync_status():
                     if result.get("errors"):
                         st.caption("部分政策源未成功抽取，已保留成功来源结果。")
                 else:
-                    st.warning("联网更新失败，已使用本地缓存或 policy 文件夹。")
-                    for error_message in result.get("errors", [])[:4]:
-                        st.caption(error_message)
+                    st.info("联网更新失败，已使用本地政策摘要库。")
 
         last_error = cache.get("last_error", "") if isinstance(cache, dict) else ""
-        if last_error:
-            st.caption(f"最近一次同步提示：{last_error}")
+        if last_error and records:
+            st.caption("最近一次同步存在部分来源未成功抽取，当前仍使用已有缓存和本地政策摘要库。")
 
 DHM_IMG = OUTPUT_DIR / "dhm_result_clean.png"
 HLG_IMG = OUTPUT_DIR / "hlg_result_clean.png"
@@ -2216,7 +2222,7 @@ flow_steps = [
     {
         "icon": "📚",
         "title": "RAG政策证据链与报告导出",
-        "desc": "基于可刷新政策证据库、本地缓存和 policy 文件夹兜底，生成政策证据链，并导出 Markdown / Word 规划分析报告。"
+        "desc": "基于政策证据链辅助、本地缓存和 policy 文件夹兜底，生成政策解释，并导出 Markdown / Word 规划分析报告。"
     }
 ]
 
@@ -2857,11 +2863,16 @@ def load_cached_policy_records():
         if not isinstance(item, dict):
             continue
         title = clean_policy_text(item.get("title") or "原文信息待补充")
-        snippet = clean_policy_text(item.get("snippet") or "原文信息待补充")
+        snippet = clean_policy_text(item.get("snippet") or item.get("summary") or "原文信息待补充")
         if not title and not snippet:
             continue
         fetched_at = item.get("fetched_at") or updated_at
-        source_name = item.get("source_name") or "官方政策源缓存"
+        source_name = item.get("source_name") or "典型政策文档库"
+        keywords = item.get("keywords", [])
+        if isinstance(keywords, str):
+            keywords = [keywords]
+        if not isinstance(keywords, list):
+            keywords = []
         records.append(
             {
                 "policy_name": title or "原文信息待补充",
@@ -2870,7 +2881,7 @@ def load_cached_policy_records():
                 "publish_date": item.get("publish_date") or "原文信息待补充",
                 "applicable_scene": "",
                 "snippet": snippet or "原文信息待补充",
-                "support_direction": "该官方公开页面片段可作为当前方案政策解释的辅助证据，具体适用性仍需以正式政策审查为准。",
+                "support_direction": item.get("support_direction") or "该政策摘要可作为当前方案政策解释的辅助证据，具体适用性仍需以正式政策审查为准。",
                 "source_file": source_name,
                 "source": source_name,
                 "source_level": item.get("source_level") or "原文信息待补充",
@@ -2878,8 +2889,9 @@ def load_cached_policy_records():
                 "data_updated_at": fetched_at or "原文信息待补充",
                 "fetched_at": fetched_at or "原文信息待补充",
                 "cache_updated_at": updated_at,
-                "keywords": item.get("keywords", []),
-                "full_text": clean_policy_text(f"{title} {snippet}"),
+                "keywords": keywords,
+                "record_origin": "policy_cache",
+                "full_text": clean_policy_text(f"{title} {' '.join([str(keyword) for keyword in keywords])} {snippet} {item.get('support_direction', '')}"),
             }
         )
     return records
@@ -3003,12 +3015,13 @@ def build_policy_relevance_reason(scenario, matched_keywords):
     return f"该片段命中「{keyword_text}」等关键词，与{scenario}下的{scene_focus}诉求相关，可支撑本方案的政策依据和优化建议。"
 
 
-def retrieve_policy_chunks(user_text, parse_result, agent_logs, top_k=5):
+def retrieve_policy_chunks(user_text, parse_result, agent_logs, top_k=3):
     documents = load_policy_documents()
+    cached_records = load_cached_policy_records()
     policy_records = []
+    policy_records.extend(cached_records)
     for doc in documents:
         policy_records.extend(parse_policy_records(doc["content"], doc["source"]))
-    policy_records.extend(load_cached_policy_records())
 
     if not policy_records:
         return []
@@ -3051,6 +3064,8 @@ def retrieve_policy_chunks(user_text, parse_result, agent_logs, top_k=5):
                 score += count * (3 if keyword in scenario_keywords else 1)
                 chunk_matched_keywords.append(keyword)
         if score > 0:
+            if record.get("record_origin") == "policy_cache":
+                score += 2
             unique_keywords = list(dict.fromkeys(chunk_matched_keywords))
             snippet = build_policy_snippet(record.get("snippet", ""), unique_keywords)
             scored_chunks.append(
@@ -3068,6 +3083,7 @@ def retrieve_policy_chunks(user_text, parse_result, agent_logs, top_k=5):
                     "matched_keywords": unique_keywords,
                     "support_direction": record.get("support_direction") or "该政策片段可作为当前方案合规解释的辅助依据。",
                     "relevance_reason": build_policy_relevance_reason(scenario, unique_keywords),
+                    "record_origin": record.get("record_origin", "policy_text"),
                     "score": score,
                 }
             )
@@ -3287,7 +3303,7 @@ def render_policy_card_grid(policy_sections):
 
 def generate_policy_explanation(user_text, parse_result, agent_logs):
     fallback_policy = build_rule_policy_explanation(user_text, parse_result, agent_logs)
-    retrieved_chunks = retrieve_policy_chunks(user_text, parse_result, agent_logs, top_k=5)
+    retrieved_chunks = retrieve_policy_chunks(user_text, parse_result, agent_logs, top_k=3)
     retrieved_sources = sorted({item["source"] for item in retrieved_chunks})
     fallback_policy["sources"] = retrieved_sources
     fallback_policy["policy_evidence"] = retrieved_chunks
