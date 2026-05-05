@@ -34,6 +34,7 @@ PROJECT_DIR = Path(__file__).resolve().parent.parent
 OUTPUT_DIR = PROJECT_DIR / "outputs"
 DATA_DIR = PROJECT_DIR / "data"
 POLICY_DIR = PROJECT_DIR / "policy"
+DEEPSEEK_REQUEST_TIMEOUT = 10
 
 
 def get_config_value(name, default=""):
@@ -45,6 +46,88 @@ def get_config_value(name, default=""):
     except Exception:
         secret_value = default
     return str(secret_value).strip() if secret_value is not None else default
+
+
+def check_file_resource(path, label):
+    if not path.exists():
+        return {
+            "ok": False,
+            "label": label,
+            "message": f"未找到 {label}，请检查项目资源是否完整。",
+        }
+    if not path.is_file():
+        return {
+            "ok": False,
+            "label": label,
+            "message": f"{label} 不是有效文件。",
+        }
+    if path.stat().st_size == 0:
+        return {
+            "ok": False,
+            "label": label,
+            "message": f"{label} 文件为空，请重新复制或生成。",
+        }
+    return {
+        "ok": True,
+        "label": label,
+        "message": f"已就绪，大小 {path.stat().st_size / 1024:.1f} KB。",
+    }
+
+
+def check_policy_resource(policy_dir):
+    if not policy_dir.exists():
+        return {
+            "ok": False,
+            "label": "policy 文件夹",
+            "message": "未找到 policy 文件夹，RAG政策证据链将无法检索本地政策摘要。",
+        }
+    if not policy_dir.is_dir():
+        return {
+            "ok": False,
+            "label": "policy 文件夹",
+            "message": "policy 路径不是有效文件夹。",
+        }
+    policy_files = list(policy_dir.glob("*.txt"))
+    if not policy_files:
+        return {
+            "ok": False,
+            "label": "policy 文件夹",
+            "message": "policy 文件夹中未找到 txt 政策摘要文件。",
+        }
+    return {
+        "ok": True,
+        "label": "policy 文件夹",
+        "message": f"已就绪，检测到 {len(policy_files)} 个政策 txt 文件。",
+    }
+
+
+def render_system_health_check():
+    checks = [
+        check_file_resource(DHM_IMG, "outputs/dhm_result_clean.png"),
+        check_file_resource(HLG_IMG, "outputs/hlg_result_clean.png"),
+        check_file_resource(DHM_SUMMARY, "data/dhm_summary.csv"),
+        check_file_resource(HLG_SUMMARY, "data/hlg_summary.csv"),
+        check_file_resource(DHM_GEOJSON, "data/dhm.geojson"),
+        check_file_resource(HLG_GEOJSON, "data/hlg.geojson"),
+        check_policy_resource(POLICY_DIR),
+    ]
+
+    api_configured = bool(get_config_value("DEEPSEEK_API_KEY"))
+    checks.append(
+        {
+            "ok": api_configured,
+            "label": "DEEPSEEK_API_KEY",
+            "message": "已配置，可使用 DeepSeek 在线解析。" if api_configured else "未配置，将使用规则解析兜底。",
+        }
+    )
+
+    with st.sidebar.expander("系统健康检查 / 演示状态检查", expanded=False):
+        st.caption("仅显示演示资源是否就绪，不显示任何 API Key 具体值。")
+        for item in checks:
+            icon = "✅" if item["ok"] else "⚠️"
+            st.write(f"{icon} {item['label']}")
+            st.caption(item["message"])
+        st.caption("技术边界：离线规划引擎 + 在线智能解释；当前演示端不进行现场 PPO/SGNN 训练。")
 
 DHM_IMG = OUTPUT_DIR / "dhm_result_clean.png"
 HLG_IMG = OUTPUT_DIR / "hlg_result_clean.png"
@@ -103,6 +186,30 @@ INSTANT_PLAN_CONFIG = {
             "引导短租服务集中布局",
             "夜间出行安全节点优化",
         ],
+    },
+}
+
+PLAN_FIT_SCENE_TARGETS = {
+    "候鸟老人友好模式": {
+        "focus_types": {10, 11, 7, 8, 13},
+        "area_target": 0.14,
+        "count_target": 0.30,
+        "road_target": 0.25,
+        "focus_label": "医疗、绿地和道路交叉节点",
+    },
+    "年轻家庭模式": {
+        "focus_types": {9, 4, 7, 8, 2},
+        "area_target": 0.55,
+        "count_target": 0.65,
+        "road_target": 0.25,
+        "focus_label": "学校、居住、绿地和道路",
+    },
+    "游客短租模式": {
+        "focus_types": {5, 12, 2, 13},
+        "area_target": 0.03,
+        "count_target": 0.55,
+        "road_target": 0.25,
+        "focus_label": "商业、休闲娱乐、道路和交叉节点",
     },
 }
 
@@ -502,6 +609,184 @@ def get_focus_type_names(focus_type_ids):
     return names
 
 
+def safe_float(value, fallback=0.0):
+    try:
+        if pd.isna(value):
+            return fallback
+        return float(value)
+    except (TypeError, ValueError):
+        return fallback
+
+
+def clamp_ratio(value):
+    return max(0.0, min(float(value), 1.0))
+
+
+def calculate_plan_fit_score(summary_df, parse_result):
+    if summary_df is None or not isinstance(summary_df, pd.DataFrame) or summary_df.empty:
+        return {
+            "available": False,
+            "message": "当前统计数据不足，暂不计算适配度评分。",
+        }
+
+    required_columns = {"type", "count", "total_area", "total_length"}
+    if not required_columns.issubset(set(summary_df.columns)):
+        return {
+            "available": False,
+            "message": "当前统计数据字段不完整，暂不计算适配度评分。",
+        }
+
+    scenario = parse_result.get("scenario", "候鸟老人友好模式") if isinstance(parse_result, dict) else "候鸟老人友好模式"
+    target_config = PLAN_FIT_SCENE_TARGETS.get(scenario, PLAN_FIT_SCENE_TARGETS["候鸟老人友好模式"])
+    focus_types = set(target_config["focus_types"])
+
+    working_df = summary_df.copy()
+    working_df["type"] = pd.to_numeric(working_df["type"], errors="coerce").fillna(-1).astype(int)
+    for column in ["count", "total_area", "total_length"]:
+        working_df[column] = pd.to_numeric(working_df[column], errors="coerce").fillna(0.0)
+
+    total_area = safe_float(working_df["total_area"].clip(lower=0).sum())
+    total_count = safe_float(working_df["count"].clip(lower=0).sum())
+    total_length = safe_float(working_df["total_length"].clip(lower=0).sum())
+
+    focus_df = working_df[working_df["type"].isin(focus_types)]
+    focus_area = safe_float(focus_df["total_area"].clip(lower=0).sum())
+    focus_count = safe_float(focus_df["count"].clip(lower=0).sum())
+    road_length = safe_float(working_df.loc[working_df["type"] == 2, "total_length"].clip(lower=0).sum())
+
+    focus_area_ratio = focus_area / total_area if total_area > 0 else 0.0
+    focus_count_ratio = focus_count / total_count if total_count > 0 else 0.0
+    road_length_ratio = road_length / total_length if total_length > 0 else 0.0
+
+    area_score = clamp_ratio(focus_area_ratio / max(target_config["area_target"], 0.01))
+    count_score = clamp_ratio(focus_count_ratio / max(target_config["count_target"], 0.01))
+    road_score = clamp_ratio(road_length_ratio / max(target_config["road_target"], 0.01))
+
+    default_weights = RULE_PARSE_DEFAULTS.get(scenario, RULE_PARSE_DEFAULTS["候鸟老人友好模式"])
+    actual_weights = []
+    expected_weights = []
+    for field in WEIGHT_FIELDS:
+        actual_weights.append(safe_float(parse_result.get(field, 0.0) if isinstance(parse_result, dict) else 0.0))
+        expected_weights.append(safe_float(default_weights.get(field, 0.0)))
+
+    actual_total = sum(actual_weights) or 1.0
+    expected_total = sum(expected_weights) or 1.0
+    actual_weights = [value / actual_total for value in actual_weights]
+    expected_weights = [value / expected_total for value in expected_weights]
+    weight_distance = sum(abs(current - expected) for current, expected in zip(actual_weights, expected_weights))
+    weight_match_score = clamp_ratio(1 - weight_distance / 2)
+
+    score = round(
+        100
+        * (
+            0.36 * area_score
+            + 0.26 * count_score
+            + 0.20 * road_score
+            + 0.18 * weight_match_score
+        )
+    )
+    score = int(max(0, min(score, 100)))
+
+    if score >= 85:
+        level = "优秀"
+    elif score >= 75:
+        level = "良好"
+    elif score >= 60:
+        level = "基本适配"
+    else:
+        level = "需优化"
+
+    focus_type_names = get_focus_type_names(focus_types)
+    explanation = (
+        f"当前场景重点关注{target_config['focus_label']}。系统综合重点 type 面积占比、"
+        f"重点 type 数量占比、道路长度占比，以及用户需求权重与场景基准权重的匹配程度，"
+        f"生成 {score} 分的展示端代理评分。该评分用于比赛演示中的解释辅助，不代表法定规划评价。"
+    )
+
+    return {
+        "available": True,
+        "score": score,
+        "level": level,
+        "scenario": scenario,
+        "focus_types": sorted(focus_types),
+        "focus_type_names": focus_type_names,
+        "focus_area_ratio": focus_area_ratio,
+        "focus_count_ratio": focus_count_ratio,
+        "road_length_ratio": road_length_ratio,
+        "weight_match_score": weight_match_score,
+        "area_score": area_score,
+        "count_score": count_score,
+        "road_score": road_score,
+        "explanation": explanation,
+        "boundary_note": "该评分为展示端代理指标，不是法定规划评价，也不代表现场 PPO/SGNN 重新训练结果。",
+    }
+
+
+def render_plan_fit_score_card(score_info):
+    if not isinstance(score_info, dict) or not score_info.get("available"):
+        message = score_info.get("message", "当前统计数据不足，暂不计算适配度评分。") if isinstance(score_info, dict) else "当前统计数据不足，暂不计算适配度评分。"
+        st.markdown(
+            f"""
+<div class="plan-fit-empty">
+{html.escape(message)}
+</div>
+""",
+            unsafe_allow_html=True,
+        )
+        return
+
+    chips = [
+        f"重点面积占比 {score_info['focus_area_ratio']:.1%}",
+        f"重点数量占比 {score_info['focus_count_ratio']:.1%}",
+        f"道路长度占比 {score_info['road_length_ratio']:.1%}",
+        f"权重匹配度 {score_info['weight_match_score']:.1%}",
+    ]
+    chip_html = "".join([f'<span class="plan-fit-chip">{html.escape(chip)}</span>' for chip in chips])
+    st.markdown(
+        f"""
+<div class="plan-fit-card">
+  <div class="plan-fit-score">
+    <div class="plan-fit-score-value">{score_info['score']}</div>
+    <div class="plan-fit-score-unit">/ 100</div>
+  </div>
+  <div class="plan-fit-body">
+    <h3>规划适配度评分 <span class="plan-fit-level">{html.escape(score_info['level'])}</span></h3>
+    <p>{html.escape(score_info['explanation'])}</p>
+    <div class="plan-fit-metrics">{chip_html}</div>
+    <p>{html.escape(score_info['boundary_note'])}</p>
+  </div>
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+
+
+def render_plan_fit_score_report(score_info):
+    if not isinstance(score_info, dict) or not score_info.get("available"):
+        message = score_info.get("message", "当前统计数据不足，暂不计算适配度评分。") if isinstance(score_info, dict) else "当前统计数据不足，暂不计算适配度评分。"
+        return f"""## 规划适配度评分与解释
+
+{message}
+
+说明：规划适配度评分为展示端代理指标，不是法定规划评价。"""
+
+    focus_text = "、".join(score_info.get("focus_type_names", [])) or "当前场景重点类型"
+    return f"""## 规划适配度评分与解释
+
+- 当前场景：{score_info['scenario']}
+- 适配度评分：{score_info['score']} / 100
+- 适配等级：{score_info['level']}
+- 重点关注类型：{focus_text}
+- 重点 type 面积占比：{score_info['focus_area_ratio']:.1%}
+- 重点 type 数量占比：{score_info['focus_count_ratio']:.1%}
+- 道路长度占比：{score_info['road_length_ratio']:.1%}
+- 权重匹配度：{score_info['weight_match_score']:.1%}
+
+解释：{score_info['explanation']}
+
+真实性边界：{score_info['boundary_note']}"""
+
+
 def render_instant_plan_report(scene_name, parse_result):
     config = get_instant_plan_config(scene_name)
     focus_names = get_focus_type_names(config["focus_types"])
@@ -663,6 +948,7 @@ def call_deepseek_parser(user_text, selected_scene, fallback):
         "HTTP 状态码": None,
         "DeepSeek 返回 content 前 300 字符": "",
         "JSON 解析失败原因": "",
+        "请求超时时间": f"{DEEPSEEK_REQUEST_TIMEOUT} 秒",
     }
     st.session_state["deepseek_debug_info"] = debug_info
 
@@ -711,15 +997,19 @@ scenario, medical_weight, education_weight, commerce_weight, green_weight, traff
     }
 
     try:
-        response = requests.post(url, headers=headers, json=payload, timeout=60)
+        response = requests.post(url, headers=headers, json=payload, timeout=DEEPSEEK_REQUEST_TIMEOUT)
         debug_info["HTTP 状态码"] = response.status_code
         debug_info["DeepSeek 返回 content 前 300 字符"] = response.text[:300]
         response.raise_for_status()
         result = response.json()
         content = result["choices"][0]["message"]["content"].strip()
+        if not content:
+            raise ValueError("DeepSeek returned empty content")
         debug_info["DeepSeek 返回 content 前 300 字符"] = content[:300]
         content = re.sub(r"^```(?:json)?\s*", "", content, flags=re.IGNORECASE)
         content = re.sub(r"\s*```$", "", content).strip()
+        if not content:
+            raise ValueError("DeepSeek returned empty JSON content")
         try:
             parsed = json.loads(content)
         except json.JSONDecodeError as e:
@@ -735,12 +1025,17 @@ scenario, medical_weight, education_weight, commerce_weight, green_weight, traff
 
 def parse_user_need(user_text, selected_scene):
     fallback = parse_with_rules(user_text, selected_scene)
+    st.session_state["ai_parser_fallback_notice"] = ""
     try:
         deepseek_result = call_deepseek_parser(user_text, selected_scene, fallback)
         if deepseek_result:
             return deepseek_result
-    except (ValueError, KeyError, TypeError, json.JSONDecodeError, error.HTTPError, error.URLError, TimeoutError, OSError):
-        pass
+    except (ValueError, KeyError, TypeError, json.JSONDecodeError, error.HTTPError, error.URLError, TimeoutError, OSError, requests.RequestException):
+        st.session_state["deepseek_debug_info"] = st.session_state.get("deepseek_debug_info", {})
+
+    if user_text.strip():
+        fallback["parse_method"] = "DeepSeek失败后规则兜底"
+        st.session_state["ai_parser_fallback_notice"] = "AI 解析暂不可用，系统已启用本地规则解析兜底。"
     return fallback
 
 
@@ -1049,6 +1344,101 @@ h2 {
     font-size: 0.92rem;
     line-height: 1.65;
     margin-top: 0.65rem;
+}
+
+.plan-fit-card {
+    display: grid;
+    grid-template-columns: minmax(110px, 0.26fr) minmax(0, 0.74fr);
+    gap: 1rem;
+    align-items: stretch;
+    color: #16324f;
+    background: linear-gradient(135deg, #fffdf8 0%, #effbff 54%, #f0fbf4 100%);
+    border: 1px solid #d6eef2;
+    border-radius: 20px;
+    padding: 1rem 1.05rem;
+    margin: 0.65rem 0 0.9rem;
+    box-shadow: 0 10px 24px rgba(31, 53, 82, 0.07);
+}
+
+.plan-fit-score {
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    align-items: center;
+    min-height: 116px;
+    border-radius: 18px;
+    background: rgba(255, 255, 255, 0.78);
+    border: 1px solid rgba(27, 143, 184, 0.14);
+}
+
+.plan-fit-score-value {
+    color: #1687ad;
+    font-size: 2.25rem;
+    line-height: 1;
+    font-weight: 850;
+}
+
+.plan-fit-score-unit {
+    color: #6c7f91;
+    font-size: 0.78rem;
+    margin-top: 0.2rem;
+}
+
+.plan-fit-body h3 {
+    margin: 0 0 0.42rem;
+    font-size: 1.08rem;
+}
+
+.plan-fit-level {
+    display: inline-flex;
+    align-items: center;
+    color: #23684a;
+    background: #e4f6eb;
+    border: 1px solid #c2e7d0;
+    border-radius: 999px;
+    padding: 0.22rem 0.62rem;
+    font-size: 0.82rem;
+    font-weight: 750;
+    margin-left: 0.45rem;
+}
+
+.plan-fit-body p {
+    color: #50677f;
+    line-height: 1.68;
+    margin: 0.28rem 0;
+}
+
+.plan-fit-metrics {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.45rem;
+    margin-top: 0.62rem;
+}
+
+.plan-fit-chip {
+    color: #0f5d73;
+    background: rgba(255, 255, 255, 0.76);
+    border: 1px solid rgba(27, 143, 184, 0.16);
+    border-radius: 999px;
+    padding: 0.24rem 0.55rem;
+    font-size: 0.82rem;
+    font-weight: 650;
+}
+
+.plan-fit-empty {
+    color: #61758a;
+    background: #fffdf8;
+    border: 1px solid #d6eef2;
+    border-radius: 18px;
+    padding: 0.82rem 0.95rem;
+    margin: 0.65rem 0 0.9rem;
+    line-height: 1.7;
+}
+
+@media (max-width: 760px) {
+    .plan-fit-card {
+        grid-template-columns: 1fr;
+    }
 }
 
 .land-use-legend-note {
@@ -1609,29 +1999,35 @@ st.sidebar.divider()
 
 st.sidebar.subheader("系统模块")
 st.sidebar.write("✅ 离线规划引擎 + 在线智能解释")
-st.sidebar.write("✅ 上游 PPO-GNN/SGNN 底层依据")
-st.sidebar.write("✅ 自然语言需求解析")
+st.sidebar.write("✅ 团队 PPO/SGNN 离线规划成果")
+st.sidebar.write("✅ 场景解析与指标权重")
 st.sidebar.write("✅ 多Agent解释辅助")
 st.sidebar.write("✅ RAG合规辅助")
 st.sidebar.write("✅ 规划图与指标展示")
 
 st.sidebar.divider()
 
-st.sidebar.info(
-    "当前演示端读取上游 PPO/SGNN 项目离线生成的规划结果图和统计表，不进行现场训练。"
-)
+render_system_health_check()
+
+st.sidebar.divider()
+
+with st.sidebar.expander("技术边界说明", expanded=False):
+    st.write("当前演示端读取团队上游 PPO/SGNN 模块离线生成的规划结果图、GeoJSON 和统计表。")
+    st.write("当前版本不进行现场 PPO/SGNN 训练，也不实时生成新的底层空间规划结果。")
+    st.write("Android 端当前为 WebView 移动应用原型，不声称已经是完整原生 Android / iOS App。")
 
 st.markdown(
     """
 <div class="island-hero">
   <div class="hero-kicker">🌊 Hainan Free Trade Port · Sanya Island Planning</div>
   <h1 class="hero-title">🌴 琼岛智划</h1>
-  <p class="hero-subtitle">面向海南自贸港的多智能体协同社区规划系统，把自然语言需求转化为清晰、可解释、可展示的 15 分钟生活圈优化方案。</p>
+  <p class="hero-subtitle">面向海南自贸港社区治理的 AI 多智能体协同规划移动应用原型，将团队深度强化学习规划成果转化为可解释、可评分、可生成报告的移动端社区治理工具。</p>
   <div class="hero-pills">
-    <span class="hero-pill">海风感交互</span>
-    <span class="hero-pill">三亚场景适配</span>
-    <span class="hero-pill">离线规划引擎 + 在线智能解释</span>
-    <span class="hero-pill">政策可解释</span>
+    <span class="hero-pill">团队 PPO/SGNN 离线规划结果</span>
+    <span class="hero-pill">GeoJSON 动态渲染</span>
+    <span class="hero-pill">规划适配度评分</span>
+    <span class="hero-pill">RAG 政策证据链</span>
+    <span class="hero-pill">Android WebView 移动端原型</span>
   </div>
 </div>
 """,
@@ -1640,11 +2036,39 @@ st.markdown(
 
 st.markdown(
     """
-本系统面向海南自贸港建设背景下的社区规划需求，采用 **离线规划引擎 + 在线智能解释** 架构：
-展示端读取上游 **PPO/SGNN** 项目离线生成的规划结果图和统计表，不进行现场训练；
-DeepSeek、多Agent、RAG 模块用于需求解析、解释生成和合规辅助，不直接改变底层空间规划结果。
+海南自贸港建设与三亚滨海社区更新过程中，候鸟老人、年轻家庭、游客短租等多元人群在医疗、教育、绿地、交通和社区治理上的需求高度叠加。传统规划图对非专业用户不够直观，政策依据和多方利益冲突也难以在移动端快速解释。
+
+琼岛智划将团队上游 PPO/SGNN 深度强化学习规划成果转化为可交互、可解释、可评分、可生成报告的移动端规划应用原型。系统基于离线规划结果，提供 GeoJSON 动态渲染、规划适配度评分、多Agent协同分析、RAG政策证据链和 Word/Markdown 报告导出，帮助使用者理解“为什么这样规划、服务谁、依据是什么”。
 """
 )
+
+st.markdown("## 技术依据：清华大学社区空间规划深度强化学习研究")
+st.markdown(
+    """
+本项目参考清华大学等团队发表于 *Nature Computational Science* 的论文 *Spatial planning of urban communities via deep reinforcement learning*。该类研究将城市社区空间规划建模为图结构上的序列决策问题，结合 GNN 状态编码、深度强化学习规划策略与 PPO/SGNN 等空间规划方法，面向 DHM / HLG 等社区场景生成离线规划结果。
+
+琼岛智划不声称清华论文为本团队原创成果，也不声称完整复现论文全部训练流程；本作品重点是在团队上游 PPO/SGNN 算法模块基础上，完成面向海南自贸港与三亚滨海社区治理场景的工程化适配、动态渲染、规划适配度评分、多Agent解释、RAG政策证据链和移动端报告展示。
+
+| 上游算法思想 | 琼岛智划中的工程化落地 |
+|---|---|
+| 图结构城市建模 | 读取 GeoJSON 中地块、道路、交叉点 type |
+| GNN 状态编码 | 作为团队 PPO/SGNN 算法模块的空间表达基础 |
+| 深度强化学习规划策略 | 接入团队离线生成的 DHM / HLG 规划结果 |
+| Service / Ecology / Traffic 指标 | 转译为医疗、教育、商业、绿地、交通五类权重 |
+| HLG / DHM 社区案例 | 接入 GeoJSON、PNG、CSV 并进行动态渲染 |
+| Human-AI 协作规划思想 | 展示端提供解释、评分、政策证据链和报告导出 |
+"""
+)
+
+with st.expander("技术边界说明", expanded=False):
+    st.markdown(
+        """
+- 当前展示端读取团队上游 PPO/SGNN 模块离线生成的规划结果图、GeoJSON 和统计表。
+- 当前版本不进行现场 PPO/SGNN 训练，也不实时生成新的底层空间规划结果。
+- DeepSeek、多Agent、RAG 用于场景解析、解释生成、合规辅助和报告生成，不直接改变底层空间规划结果。
+- Android 端当前为 WebView 移动应用原型，不声称已经是完整原生 Android / iOS App。
+"""
+    )
 
 st.markdown("## 海南特色场景适配")
 st.markdown("针对海南自贸港建设与三亚等热带滨海城市特点，系统提供三大特色场景适配方案：")
@@ -1690,34 +2114,34 @@ st.markdown("## 系统工作流")
 
 flow_steps = [
     {
-        "icon": "📝",
-        "title": "自然语言需求输入",
-        "desc": "用户以自然语言描述社区规划需求，支持手动输入或选择演示样例。"
+        "icon": "🧠",
+        "title": "团队上游算法成果接入",
+        "desc": "接入团队 PPO/SGNN 离线规划模块生成的 DHM / HLG 规划结果、GeoJSON 和空间统计表。"
     },
     {
-        "icon": "🔍",
-        "title": "场景识别与指标权重",
-        "desc": "系统根据关键词自动识别场景（候鸟老人/年轻家庭/游客短租），并生成对应指标权重配置。"
-    },
-    {
-        "icon": "🤝",
-        "title": "多Agent解释辅助",
-        "desc": "居民Agent、政府Agent、产业运营Agent模拟多方诉求，协调器Agent输出解释性折中建议。"
+        "icon": "🌴",
+        "title": "海南社区场景化适配",
+        "desc": "面向候鸟老人、年轻家庭、游客短租三类场景，配置医疗、教育、商业、绿地、交通五类指标权重。"
     },
     {
         "icon": "🗺️",
-        "title": "上游PPO-GNN/SGNN离线结果",
-        "desc": "读取上游 PPO-GNN/SGNN 项目离线生成的规划结果图与空间指标统计表。"
+        "title": "GeoJSON动态渲染与图层高亮",
+        "desc": "基于 GeoJSON type 字段实时渲染规划图，并高亮当前场景重点设施和空间类型。"
+    },
+    {
+        "icon": "📊",
+        "title": "规划适配度评分",
+        "desc": "综合重点 type 面积、数量、道路长度和权重匹配程度，生成 0-100 的展示端代理评分。"
+    },
+    {
+        "icon": "🤝",
+        "title": "多Agent协同解释",
+        "desc": "居民、政府、产业运营等 Agent 模拟多方诉求，输出解释性折中建议。"
     },
     {
         "icon": "📚",
-        "title": "RAG合规辅助",
-        "desc": "基于本地政策文本检索增强，生成场景特定的合规性解释文本。"
-    },
-    {
-        "icon": "📋",
-        "title": "一键生成报告",
-        "desc": "自动整合所有内容，生成可下载的Markdown格式规划分析报告。"
+        "title": "RAG政策证据链与报告导出",
+        "desc": "检索本地政策摘要，生成政策证据链，并导出 Markdown / Word 规划分析报告。"
     }
 ]
 
@@ -1748,14 +2172,18 @@ with left:
     default_input = demo_samples.get(selected_sample, "")
     
     user_input = st.text_area(
-        "请输入你的规划需求",
+        "可选：补充社区需求描述",
         value=default_input,
         placeholder="例如：这个社区候鸟老人比较多，希望步行10分钟内能到医院、菜市场和公园，绿地多一点，过马路少一点。",
         height=120
     )
+    st.caption("输入内容用于辅助场景识别、指标权重配置和报告解释；底层空间规划结果来自团队上游 PPO/SGNN 离线输出。")
 
 parse_result = parse_user_need(user_input, scene)
 auto_scene = parse_result["scenario"]
+ai_parser_fallback_notice = st.session_state.get("ai_parser_fallback_notice", "")
+if ai_parser_fallback_notice:
+    st.warning(ai_parser_fallback_notice)
 
 with right:
     st.markdown("### 当前选择场景")
@@ -1895,6 +2323,18 @@ if summary_path.exists():
     except Exception as e:
         summary_error = str(e)
 
+plan_fit_score = calculate_plan_fit_score(summary_df, parse_result)
+if summary_error:
+    plan_fit_score = {
+        "available": False,
+        "message": "当前统计数据不足，暂不计算适配度评分。",
+    }
+
+with st.container(border=True):
+    st.markdown("### 规划适配度评分")
+    render_plan_fit_score_card(plan_fit_score)
+    st.caption("评分基于当前场景、五类需求权重和空间统计 CSV 计算，是展示端代理指标，不代表法定规划评价。")
+
 result_tab_image, result_tab_geojson, result_tab_instant, result_tab_table, result_tab_chart = st.tabs(["规划结果图", "动态GeoJSON图", "即时建议图", "空间统计表", "数值指标图"])
 
 with result_tab_image:
@@ -1909,7 +2349,7 @@ with result_tab_image:
                     st.markdown(
                         """
 <div class="result-caption">
-该图为上游 PPO/SGNN 项目离线生成结果的展示图，当前演示端不进行现场训练或实时生成新规划图。
+该图为团队上游 PPO/SGNN 离线规划成果的展示图，当前演示端不进行现场训练或实时生成新规划图。
 </div>
 """,
                         unsafe_allow_html=True,
@@ -2021,7 +2461,7 @@ st.markdown("## 3. 离线规划引擎 + 在线智能解释")
 st.markdown(
     """
 <div class="tech-flow-note">
-当前演示端读取上游 PPO/SGNN 项目离线生成的规划结果图和统计表，不进行现场训练；DeepSeek、多Agent、RAG 模块用于需求解析、解释生成和合规辅助，不直接改变底层空间规划结果。
+当前演示端读取团队上游 PPO/SGNN 离线规划成果中的规划结果图和统计表，不进行现场训练；DeepSeek、多Agent、RAG 模块用于需求解析、解释生成和合规辅助，不直接改变底层空间规划结果。
 </div>
 <div class="tech-flow-grid">
   <div class="tech-flow-card">
@@ -2271,12 +2711,16 @@ JSON 必须严格使用以下结构，每个字段都不能为空：
     }
 
     try:
-        response = requests.post(url, headers=headers, json=payload, timeout=60)
+        response = requests.post(url, headers=headers, json=payload, timeout=DEEPSEEK_REQUEST_TIMEOUT)
         response.raise_for_status()
         result = response.json()
         content = result["choices"][0]["message"]["content"].strip()
+        if not content:
+            raise ValueError("DeepSeek Agent API returned empty content")
         content = re.sub(r"^```(?:json)?\s*", "", content, flags=re.IGNORECASE)
         content = re.sub(r"\s*```$", "", content).strip()
+        if not content:
+            raise ValueError("DeepSeek Agent API returned empty JSON content")
         parsed = json.loads(content)
         return normalize_agent_logs(parsed, fallback_logs)
     except Exception as e:
@@ -2770,12 +3214,16 @@ AI识别结果：{json.dumps(parse_result, ensure_ascii=False)}
     }
 
     try:
-        response = requests.post(url, headers=headers, json=payload, timeout=60)
+        response = requests.post(url, headers=headers, json=payload, timeout=DEEPSEEK_REQUEST_TIMEOUT)
         response.raise_for_status()
         result = response.json()
         content = result["choices"][0]["message"]["content"].strip()
+        if not content:
+            raise ValueError("DeepSeek Policy API returned empty content")
         content = re.sub(r"^```(?:json)?\s*", "", content, flags=re.IGNORECASE)
         content = re.sub(r"\s*```$", "", content).strip()
+        if not content:
+            raise ValueError("DeepSeek Policy API returned empty JSON content")
         parsed = json.loads(content)
         return normalize_policy_explanation(parsed, fallback_policy)
     except Exception as e:
@@ -2966,6 +3414,7 @@ def build_report():
     weight_total = sum([value for _, value in parsed_weight_items])
     weight_explanation = get_weight_explanation(report_scene)
     planning_summary = summarize_space_statistics(summary_df)
+    plan_fit_text = render_plan_fit_score_report(plan_fit_score)
     report_agent_logs = get_report_agent_logs(agent_logs, user_input, parse_result)
     logs_text = render_agent_report(report_agent_logs)
     policy_text = render_policy_report(policy_sections, user_input, parse_result, report_agent_logs)
@@ -2973,7 +3422,7 @@ def build_report():
     risks, suggestions = get_integrated_risks_and_suggestions(report_scene)
     risks_text = "\n".join([f"{index}. {item}" for index, item in enumerate(risks, start=1)])
     suggestions_text = "\n".join([f"{index}. {item}" for index, item in enumerate(suggestions, start=1)])
-    image_note = f"当前场景对应的规划结果图为 `{img_path.name}`。报告不嵌入图片，页面端展示上游 PPO/SGNN 项目离线生成结果的示意图和统计表，不进行现场训练，也不实时推理生成新规划图。当前页面图片为展示端基于 GeoJSON `type` 字段生成的可视化结果，颜色采用展示端渲染配色。页面端支持基于离线 GeoJSON 的动态渲染与场景重点类型高亮，但当前版本不进行现场 PPO/SGNN 训练或实时生成新规划结果。"
+    image_note = f"当前场景对应的规划结果图为 `{img_path.name}`。报告不嵌入图片，页面端展示团队上游 PPO/SGNN 离线规划成果中的示意图和统计表，不进行现场训练，也不实时推理生成新规划图。当前页面图片为展示端基于 GeoJSON `type` 字段生成的可视化结果，颜色采用展示端渲染配色。页面端支持基于离线 GeoJSON 的动态渲染与场景重点类型高亮，但当前版本不进行现场 PPO/SGNN 训练或实时生成新规划结果。"
     legend_report_rows = [
         "| type | 上游类型 | 中文含义 | 展示端颜色 | 说明 |",
         "|---|---|---|---|---|",
@@ -2992,7 +3441,7 @@ def build_report():
 
 ## 一、项目背景
 
-本系统面向海南自贸港与三亚滨海社区规划场景，采用“离线规划引擎 + 在线智能解释”架构：展示端读取上游 PPO/SGNN 项目离线生成的规划结果图和统计表，不进行现场训练；DeepSeek、多Agent、RAG 模块用于需求解析、解释生成和合规辅助，不直接改变底层空间规划结果。
+本系统面向海南自贸港与三亚滨海社区规划场景，采用“离线规划引擎 + 在线智能解释”架构：展示端读取团队上游 PPO/SGNN 离线规划成果中的规划结果图和统计表，不进行现场训练；DeepSeek、多Agent、RAG 模块用于需求解析、解释生成和合规辅助，不直接改变底层空间规划结果。
 
 ## 二、用户需求
 
@@ -3028,13 +3477,15 @@ type 含义来自上游 DRL urban planning 项目的 `city_config.py`。当前�
 
 注：颜色为展示端渲染配色，土地类型含义以上游 `city_config.py` 的 `type` 定义为准。其中 `type=4` 表示**居住用地**，`type=7`、`type=8` 表示**绿地类用地**。
 
+{plan_fit_text}
+
 {instant_plan_text}
 
 ## 六、离线规划引擎 + 在线智能解释（PPO-GNN/SGNN离线规划流程说明）
 
-上游 PPO-GNN/SGNN 项目作为底层算法依据，以社区空间地块、道路、设施和用地类型等空间属性为输入，将地块或空间单元抽象为图节点，并把邻接关系、道路连接或空间相邻关系建模为边。当前琼岛智划展示端没有集成完整 PPO/SGNN 训练引擎，也不在页面端执行模型训练或实时推理生成新规划图。
+团队上游 PPO/SGNN 算法模块作为底层算法依据，以社区空间地块、道路、设施和用地类型等空间属性为输入，将地块或空间单元抽象为图节点，并把邻接关系、道路连接或空间相邻关系建模为边。当前琼岛智划展示端没有集成完整 PPO/SGNN 训练引擎，也不在页面端执行模型训练或实时推理生成新规划图。
 
-当前演示端读取上游 PPO/SGNN 项目离线生成的规划结果图和统计表，不进行现场训练；展示端结合用户需求解析、多Agent解释辅助和 RAG 合规辅助，生成可展示、可下载的规划分析结果。DeepSeek、多Agent、RAG 模块用于需求解析、解释生成和合规辅助，不直接改变底层空间规划结果。
+当前演示端读取团队上游 PPO/SGNN 离线规划成果中的规划结果图和统计表，不进行现场训练；展示端结合用户需求解析、多Agent解释辅助和 RAG 合规辅助，生成可展示、可下载的规划分析结果。DeepSeek、多Agent、RAG 模块用于需求解析、解释生成和合规辅助，不直接改变底层空间规划结果。
 
 ## 七、多Agent解释辅助
 
@@ -3060,7 +3511,7 @@ type 含义来自上游 DRL urban planning 项目的 `city_config.py`。当前�
 
 ## 十一、当前演示说明
 
-当前版本为第一版演示系统，展示端读取上游 PPO/SGNN 项目离线生成的空间规划结果图、统计表和本地政策文本，不进行现场模型训练，也不实时推理生成新规划图。上游算法可在 Linux / WSL2 环境独立复现或扩展，展示端运行于 Windows + Streamlit 环境。
+当前版本为第一版演示系统，展示端读取团队上游 PPO/SGNN 离线规划成果中的空间规划结果图、统计表和本地政策文本，不进行现场模型训练，也不实时推理生成新规划图。团队上游算法模块可在 Linux / WSL2 环境独立复现或扩展，展示端运行于 Windows + Streamlit 环境。
 
 ---
 
