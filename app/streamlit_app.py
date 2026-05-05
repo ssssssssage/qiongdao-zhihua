@@ -34,7 +34,16 @@ PROJECT_DIR = Path(__file__).resolve().parent.parent
 OUTPUT_DIR = PROJECT_DIR / "outputs"
 DATA_DIR = PROJECT_DIR / "data"
 POLICY_DIR = PROJECT_DIR / "policy"
+POLICY_SOURCES_PATH = PROJECT_DIR / "policy_sources.json"
+POLICY_CACHE_PATH = DATA_DIR / "policy_cache.json"
 DEEPSEEK_REQUEST_TIMEOUT = 10
+
+try:
+    from core.policy_sync import load_policy_cache, load_policy_sources, sync_policy_sources
+    POLICY_SYNC_AVAILABLE = True
+except Exception as e:
+    POLICY_SYNC_AVAILABLE = False
+    POLICY_SYNC_IMPORT_ERROR = str(e)
 
 
 def get_config_value(name, default=""):
@@ -128,6 +137,69 @@ def render_system_health_check():
             st.write(f"{icon} {item['label']}")
             st.caption(item["message"])
         st.caption("技术边界：离线规划引擎 + 在线智能解释；当前演示端不进行现场 PPO/SGNN 训练。")
+
+
+def get_policy_cache_status():
+    if not POLICY_SYNC_AVAILABLE:
+        return {
+            "updated_at": "",
+            "records": [],
+            "sources": [],
+            "last_error": f"政策同步模块暂不可用：{POLICY_SYNC_IMPORT_ERROR}",
+        }
+    cache = load_policy_cache(POLICY_CACHE_PATH)
+    sources = load_policy_sources(POLICY_SOURCES_PATH)
+    if sources:
+        cache["sources"] = sources
+    return cache
+
+
+def render_policy_sync_status():
+    st.markdown("## 官方政策源准实时更新")
+    with st.expander("官方政策源更新状态 / 可刷新政策证据库", expanded=False):
+        st.caption("用于补充政策证据链的公开页面准实时同步；当前仅作为参赛演示和规划解释辅助。")
+
+        cache = get_policy_cache_status()
+        records = cache.get("records", []) if isinstance(cache, dict) else []
+        sources = cache.get("sources", []) if isinstance(cache, dict) else []
+        updated_at = cache.get("updated_at", "") if isinstance(cache, dict) else ""
+
+        metric_cols = st.columns(2)
+        metric_cols[0].metric("当前政策缓存条数", len(records))
+        metric_cols[1].metric("最近更新时间", updated_at or "暂无缓存")
+
+        if sources:
+            st.markdown("**政策源列表**")
+            for source in sources:
+                if not isinstance(source, dict):
+                    continue
+                enabled_text = "启用" if source.get("enabled", True) else "停用"
+                st.caption(
+                    f"✅ {source.get('name', '未命名政策源')}｜{source.get('source_level', '来源级别待补充')}｜"
+                    f"{source.get('source_org', '来源机构待补充')}｜{enabled_text}"
+                )
+        else:
+            st.warning("未找到 policy_sources.json，当前仅使用本地 policy 文件夹。")
+
+        if st.button("刷新政策库", type="secondary", use_container_width=True):
+            if not POLICY_SYNC_AVAILABLE:
+                st.warning("政策同步模块暂不可用，已使用本地缓存或 policy 文件夹。")
+            else:
+                result = sync_policy_sources(POLICY_SOURCES_PATH, POLICY_CACHE_PATH, timeout=10)
+                if result.get("ok"):
+                    st.success(
+                        f"政策库已刷新：{result.get('record_count', 0)} 条缓存记录，更新时间 {result.get('updated_at', '原文信息待补充')}。"
+                    )
+                    if result.get("errors"):
+                        st.caption("部分政策源未成功抽取，已保留成功来源结果。")
+                else:
+                    st.warning("联网更新失败，已使用本地缓存或 policy 文件夹。")
+                    for error_message in result.get("errors", [])[:4]:
+                        st.caption(error_message)
+
+        last_error = cache.get("last_error", "") if isinstance(cache, dict) else ""
+        if last_error:
+            st.caption(f"最近一次同步提示：{last_error}")
 
 DHM_IMG = OUTPUT_DIR / "dhm_result_clean.png"
 HLG_IMG = OUTPUT_DIR / "hlg_result_clean.png"
@@ -1271,6 +1343,7 @@ h2 {
     font-size: 0.88rem;
     line-height: 1.55;
     margin: 0.12rem 0;
+    overflow-wrap: anywhere;
 }
 
 .policy-evidence-label {
@@ -2014,6 +2087,7 @@ st.sidebar.divider()
 with st.sidebar.expander("技术边界说明", expanded=False):
     st.write("当前演示端读取团队上游 PPO/SGNN 模块离线生成的规划结果图、GeoJSON 和统计表。")
     st.write("当前版本不进行现场 PPO/SGNN 训练，也不实时生成新的底层空间规划结果。")
+    st.write("政策库采用官方公开页面准实时同步与本地缓存机制，当前用于参赛演示和规划解释辅助，不替代正式政策审查。")
     st.write("Android 端当前为 WebView 移动应用原型，不声称已经是完整原生 Android / iOS App。")
 
 st.markdown(
@@ -2066,6 +2140,7 @@ with st.expander("技术边界说明", expanded=False):
 - 当前展示端读取团队上游 PPO/SGNN 模块离线生成的规划结果图、GeoJSON 和统计表。
 - 当前版本不进行现场 PPO/SGNN 训练，也不实时生成新的底层空间规划结果。
 - DeepSeek、多Agent、RAG 用于场景解析、解释生成、合规辅助和报告生成，不直接改变底层空间规划结果。
+- 政策库采用官方公开页面准实时同步与本地缓存机制，当前用于参赛演示和规划解释辅助，不替代正式政策审查。
 - Android 端当前为 WebView 移动应用原型，不声称已经是完整原生 Android / iOS App。
 """
     )
@@ -2141,7 +2216,7 @@ flow_steps = [
     {
         "icon": "📚",
         "title": "RAG政策证据链与报告导出",
-        "desc": "检索本地政策摘要，生成政策证据链，并导出 Markdown / Word 规划分析报告。"
+        "desc": "基于可刷新政策证据库、本地缓存和 policy 文件夹兜底，生成政策证据链，并导出 Markdown / Word 规划分析报告。"
     }
 ]
 
@@ -2772,6 +2847,44 @@ def load_policy_documents():
     return documents
 
 
+def load_cached_policy_records():
+    if not POLICY_SYNC_AVAILABLE:
+        return []
+    cache = load_policy_cache(POLICY_CACHE_PATH)
+    updated_at = cache.get("updated_at", "") or "原文信息待补充"
+    records = []
+    for item in cache.get("records", []):
+        if not isinstance(item, dict):
+            continue
+        title = clean_policy_text(item.get("title") or "原文信息待补充")
+        snippet = clean_policy_text(item.get("snippet") or "原文信息待补充")
+        if not title and not snippet:
+            continue
+        fetched_at = item.get("fetched_at") or updated_at
+        source_name = item.get("source_name") or "官方政策源缓存"
+        records.append(
+            {
+                "policy_name": title or "原文信息待补充",
+                "issuer": item.get("source_org") or "原文信息待补充",
+                "year_or_date": item.get("publish_date") or "原文信息待补充",
+                "publish_date": item.get("publish_date") or "原文信息待补充",
+                "applicable_scene": "",
+                "snippet": snippet or "原文信息待补充",
+                "support_direction": "该官方公开页面片段可作为当前方案政策解释的辅助证据，具体适用性仍需以正式政策审查为准。",
+                "source_file": source_name,
+                "source": source_name,
+                "source_level": item.get("source_level") or "原文信息待补充",
+                "url": item.get("url") or "",
+                "data_updated_at": fetched_at or "原文信息待补充",
+                "fetched_at": fetched_at or "原文信息待补充",
+                "cache_updated_at": updated_at,
+                "keywords": item.get("keywords", []),
+                "full_text": clean_policy_text(f"{title} {snippet}"),
+            }
+        )
+    return records
+
+
 def split_policy_text(content, chunk_size=520):
     paragraphs = [p.strip() for p in re.split(r"\n\s*\n+", content) if p.strip()]
     if not paragraphs:
@@ -2820,6 +2933,9 @@ def parse_policy_records(content, source_file):
                     "snippet": snippet,
                     "support_direction": support_direction or "可作为当前方案合规解释的辅助依据。",
                     "source_file": source_file,
+                    "publish_date": year_or_date or "未注明时间",
+                    "url": "",
+                    "data_updated_at": "本地政策文件",
                     "full_text": clean_policy_text(block),
                 }
             )
@@ -2838,6 +2954,9 @@ def parse_policy_records(content, source_file):
                 "snippet": clean_policy_text(chunk),
                 "support_direction": "该摘要片段可作为当前方案合规解释的辅助依据。",
                 "source_file": source_file,
+                "publish_date": "未注明时间",
+                "url": "",
+                "data_updated_at": "本地政策文件",
                 "full_text": clean_policy_text(chunk),
             }
         )
@@ -2886,7 +3005,12 @@ def build_policy_relevance_reason(scenario, matched_keywords):
 
 def retrieve_policy_chunks(user_text, parse_result, agent_logs, top_k=5):
     documents = load_policy_documents()
-    if not documents:
+    policy_records = []
+    for doc in documents:
+        policy_records.extend(parse_policy_records(doc["content"], doc["source"]))
+    policy_records.extend(load_cached_policy_records())
+
+    if not policy_records:
         return []
 
     scenario = parse_result.get("scenario", "")
@@ -2905,43 +3029,48 @@ def retrieve_policy_chunks(user_text, parse_result, agent_logs, top_k=5):
     keywords = list(dict.fromkeys(scenario_keywords + matched_keywords))
 
     scored_chunks = []
-    for doc in documents:
-        for record in parse_policy_records(doc["content"], doc["source"]):
-            searchable = " ".join(
-                [
-                    record["source_file"],
-                    record["policy_name"],
-                    record["issuer"],
-                    record["year_or_date"],
-                    record["applicable_scene"],
-                    record["snippet"],
-                    record["support_direction"],
-                ]
+    for record in policy_records:
+        searchable = " ".join(
+            [
+                record.get("source_file", ""),
+                record.get("policy_name", ""),
+                record.get("issuer", ""),
+                record.get("year_or_date", ""),
+                record.get("publish_date", ""),
+                record.get("applicable_scene", ""),
+                record.get("snippet", ""),
+                record.get("support_direction", ""),
+                " ".join(record.get("keywords", []) if isinstance(record.get("keywords", []), list) else []),
+            ]
+        )
+        score = 0
+        chunk_matched_keywords = []
+        for keyword in keywords:
+            count = searchable.count(keyword)
+            if count:
+                score += count * (3 if keyword in scenario_keywords else 1)
+                chunk_matched_keywords.append(keyword)
+        if score > 0:
+            unique_keywords = list(dict.fromkeys(chunk_matched_keywords))
+            snippet = build_policy_snippet(record.get("snippet", ""), unique_keywords)
+            scored_chunks.append(
+                {
+                    "policy_name": record.get("policy_name") or "原文信息待补充",
+                    "issuer": record.get("issuer") or "原文信息待补充",
+                    "year_or_date": record.get("year_or_date") or record.get("publish_date") or "原文信息待补充",
+                    "publish_date": record.get("publish_date") or record.get("year_or_date") or "原文信息待补充",
+                    "source_file": record.get("source_file") or "原文信息待补充",
+                    "source": record.get("source_file") or record.get("source") or "原文信息待补充",
+                    "source_level": record.get("source_level", ""),
+                    "url": record.get("url", ""),
+                    "data_updated_at": record.get("data_updated_at") or record.get("fetched_at") or "本地政策文件",
+                    "snippet": snippet or "原文信息待补充",
+                    "matched_keywords": unique_keywords,
+                    "support_direction": record.get("support_direction") or "该政策片段可作为当前方案合规解释的辅助依据。",
+                    "relevance_reason": build_policy_relevance_reason(scenario, unique_keywords),
+                    "score": score,
+                }
             )
-            score = 0
-            chunk_matched_keywords = []
-            for keyword in keywords:
-                count = searchable.count(keyword)
-                if count:
-                    score += count * (3 if keyword in scenario_keywords else 1)
-                    chunk_matched_keywords.append(keyword)
-            if score > 0:
-                unique_keywords = list(dict.fromkeys(chunk_matched_keywords))
-                snippet = build_policy_snippet(record["snippet"], unique_keywords)
-                scored_chunks.append(
-                    {
-                        "policy_name": record["policy_name"],
-                        "issuer": record["issuer"],
-                        "year_or_date": record["year_or_date"],
-                        "source_file": record["source_file"],
-                        "source": record["source_file"],
-                        "snippet": snippet,
-                        "matched_keywords": unique_keywords,
-                        "support_direction": record["support_direction"],
-                        "relevance_reason": build_policy_relevance_reason(scenario, unique_keywords),
-                        "score": score,
-                    }
-                )
 
     scored_chunks.sort(key=lambda item: item["score"], reverse=True)
     return scored_chunks[:top_k]
@@ -3037,14 +3166,18 @@ def render_policy_evidence_markdown(policy_sections):
         keywords = "、".join(item.get("matched_keywords", [])[:8]) or "无明确关键词"
         policy_name = item.get("policy_name") or item.get("source") or "未知政策"
         issuer = item.get("issuer", "未注明发布机构")
-        year_or_date = item.get("year_or_date", "未注明时间")
+        publish_date = item.get("publish_date") or item.get("year_or_date", "原文信息待补充")
         source_file = item.get("source_file") or item.get("source", "未知来源文件")
+        source_url = item.get("url") or "原文信息待补充"
+        data_updated_at = item.get("data_updated_at") or item.get("fetched_at") or "本地政策文件"
         blocks.append(
             f"""#### 政策{index}：{policy_name}
 
 - 发布机构：{issuer}
-- 时间：{year_or_date}
+- 发布日期：{publish_date}
 - 来源文件：{source_file}
+- 来源链接：{source_url}
+- 数据更新时间：{data_updated_at}
 - 命中关键词：{keywords}
 - 命中片段：{item.get('snippet', '未检索到明确片段')}
 - 支撑方向：{item.get('support_direction', '该政策片段可作为当前方案合规解释的辅助依据。')}"""
@@ -3070,8 +3203,11 @@ def render_policy_evidence_cards(policy_sections):
     for item in evidence_items[:5]:
         policy_name = html.escape(str(item.get("policy_name") or item.get("source") or "未知政策"))
         issuer = html.escape(str(item.get("issuer", "未注明发布机构")))
-        year_or_date = html.escape(str(item.get("year_or_date", "未注明时间")))
+        publish_date = html.escape(str(item.get("publish_date") or item.get("year_or_date", "原文信息待补充")))
         source_file = html.escape(str(item.get("source_file") or item.get("source", "未知来源文件")))
+        source_url_raw = str(item.get("url", "") or "")
+        source_url = html.escape(source_url_raw or "原文信息待补充")
+        data_updated_at = html.escape(str(item.get("data_updated_at") or item.get("fetched_at") or "本地政策文件"))
         snippet = html.escape(str(item.get("snippet", "未检索到明确片段")))
         support_direction = html.escape(str(item.get("support_direction", "该政策片段可作为当前方案合规解释的辅助依据。")))
         keywords = item.get("matched_keywords", [])
@@ -3084,8 +3220,10 @@ def render_policy_evidence_cards(policy_sections):
             f"""
 <div class="policy-evidence-card">
   <div class="policy-evidence-source">{policy_name}</div>
-  <p class="policy-evidence-meta">发布机构 / 年份：{issuer} / {year_or_date}</p>
+  <p class="policy-evidence-meta">来源机构 / 发布日期：{issuer} / {publish_date}</p>
   <p class="policy-evidence-meta">来源文件：{source_file}</p>
+  <p class="policy-evidence-meta">来源链接：{source_url}</p>
+  <p class="policy-evidence-meta">数据更新时间：{data_updated_at}</p>
   <div class="policy-evidence-label">命中关键词</div>
   <div class="policy-keyword-badges">{keyword_badges}</div>
   <div class="policy-evidence-label">命中片段</div>
@@ -3167,7 +3305,7 @@ def generate_policy_explanation(user_text, parse_result, agent_logs):
     weights = {field: parse_result[field] for field in WEIGHT_FIELDS}
     policy_context = "\n\n".join(
         [
-            f"政策名称：{item.get('policy_name', '未知政策')}｜发布机构：{item.get('issuer', '未注明发布机构')}｜时间：{item.get('year_or_date', '未注明时间')}｜来源文件：{item.get('source_file', item.get('source', '未知来源'))}｜相关度：{item['score']}｜命中关键词：{'、'.join(item.get('matched_keywords', []))}\n{item['snippet']}\n支撑方向：{item.get('support_direction', item.get('relevance_reason', '该政策片段可作为当前方案合规解释的辅助依据。'))}"
+            f"政策名称：{item.get('policy_name', '未知政策')}｜发布机构：{item.get('issuer', '未注明发布机构')}｜发布日期：{item.get('publish_date', item.get('year_or_date', '原文信息待补充'))}｜来源文件：{item.get('source_file', item.get('source', '未知来源'))}｜来源链接：{item.get('url', '原文信息待补充')}｜数据更新时间：{item.get('data_updated_at', '本地政策文件')}｜相关度：{item['score']}｜命中关键词：{'、'.join(item.get('matched_keywords', []))}\n{item['snippet']}\n支撑方向：{item.get('support_direction', item.get('relevance_reason', '该政策片段可作为当前方案合规解释的辅助依据。'))}"
             for item in retrieved_chunks
         ]
     )
@@ -3231,6 +3369,8 @@ AI识别结果：{json.dumps(parse_result, ensure_ascii=False)}
         return fallback_policy
 
 
+render_policy_sync_status()
+
 policy_sections = generate_policy_explanation(user_input, parse_result, agent_logs)
 policy_explanation = render_policy_markdown(policy_sections)
 
@@ -3239,7 +3379,7 @@ if policy_evidence_items:
     source_count = len(policy_evidence_items)
     source_items = "".join(
         [
-            f"<li>{html.escape(str(item.get('policy_name', '未知政策')))}｜{html.escape(str(item.get('issuer', '未注明发布机构')))}｜{html.escape(str(item.get('year_or_date', '未注明时间')))}</li>"
+            f"<li>{html.escape(str(item.get('policy_name', '未知政策')))}｜{html.escape(str(item.get('issuer', '未注明发布机构')))}｜{html.escape(str(item.get('publish_date') or item.get('year_or_date', '原文信息待补充')))}｜更新：{html.escape(str(item.get('data_updated_at') or item.get('fetched_at', '本地政策文件')))}</li>"
             for item in policy_evidence_items[:5]
         ]
     )
@@ -3348,7 +3488,7 @@ def render_policy_report(policy_sections, user_text, parse_result, agent_logs):
     if evidence_items:
         source_text = "\n".join(
             [
-                f"- {safe_report_text(item.get('policy_name'), '未知政策')}｜{safe_report_text(item.get('issuer'), '未注明发布机构')}｜{safe_report_text(item.get('year_or_date'), '未注明时间')}"
+                f"- {safe_report_text(item.get('policy_name'), '未知政策')}｜{safe_report_text(item.get('issuer'), '未注明发布机构')}｜发布日期：{safe_report_text(item.get('publish_date') or item.get('year_or_date'), '原文信息待补充')}｜来源链接：{safe_report_text(item.get('url'), '原文信息待补充')}｜数据更新时间：{safe_report_text(item.get('data_updated_at') or item.get('fetched_at'), '本地政策文件')}"
                 for item in evidence_items[:5]
             ]
         )
@@ -3441,7 +3581,7 @@ def build_report():
 
 ## 一、项目背景
 
-本系统面向海南自贸港与三亚滨海社区规划场景，采用“离线规划引擎 + 在线智能解释”架构：展示端读取团队上游 PPO/SGNN 离线规划成果中的规划结果图和统计表，不进行现场训练；DeepSeek、多Agent、RAG 模块用于需求解析、解释生成和合规辅助，不直接改变底层空间规划结果。
+本系统面向海南自贸港与三亚滨海社区规划场景，采用“离线规划引擎 + 在线智能解释”架构：展示端读取团队上游 PPO/SGNN 离线规划成果中的规划结果图和统计表，不进行现场训练；DeepSeek、多Agent、RAG 模块用于需求解析、解释生成和合规辅助，不直接改变底层空间规划结果。政策库采用官方公开页面准实时同步与本地缓存机制，当前用于参赛演示和规划解释辅助，不替代正式政策审查。
 
 ## 二、用户需求
 
@@ -3507,11 +3647,11 @@ type 含义来自上游 DRL urban planning 项目的 `city_config.py`。当前�
 
 ## 十、结论
 
-本次规划建议以 DeepSeek/LLM 对自然语言需求的解析为入口，结合多Agent对居民、政府、商业三方诉求的解释辅助，并通过轻量级 RAG 对本地政策文本进行合规解释支撑。整体方案面向海南自贸港社区治理与三亚滨海社区更新场景，能够为15分钟生活圈目标解释、公共服务配置说明和空间治理展示提供可解释依据；这些在线智能解释模块不直接改变底层空间规划结果。
+本次规划建议以 DeepSeek/LLM 对自然语言需求的解析为入口，结合多Agent对居民、政府、商业三方诉求的解释辅助，并通过轻量级 RAG、官方公开页面准实时同步与本地缓存机制对政策文本进行合规解释支撑。整体方案面向海南自贸港社区治理与三亚滨海社区更新场景，能够为15分钟生活圈目标解释、公共服务配置说明和空间治理展示提供可解释依据；这些在线智能解释模块不直接改变底层空间规划结果，也不替代正式政策审查。
 
 ## 十一、当前演示说明
 
-当前版本为第一版演示系统，展示端读取团队上游 PPO/SGNN 离线规划成果中的空间规划结果图、统计表和本地政策文本，不进行现场模型训练，也不实时推理生成新规划图。团队上游算法模块可在 Linux / WSL2 环境独立复现或扩展，展示端运行于 Windows + Streamlit 环境。
+当前版本为第一版演示系统，展示端读取团队上游 PPO/SGNN 离线规划成果中的空间规划结果图、统计表和政策证据库，不进行现场模型训练，也不实时推理生成新规划图。政策证据库支持官方公开页面准实时同步、本地缓存和 policy 文件夹兜底；团队上游算法模块可在 Linux / WSL2 环境独立复现或扩展，展示端运行于 Windows + Streamlit 环境。
 
 ---
 

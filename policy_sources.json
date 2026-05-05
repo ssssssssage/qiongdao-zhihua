@@ -1,0 +1,30 @@
+[
+  {
+    "name": "国务院政策文件库",
+    "url": "https://www.gov.cn/zhengce/zhengcewenjianku/",
+    "source_level": "国家级",
+    "source_org": "国务院 / 中国政府网",
+    "enabled": true
+  },
+  {
+    "name": "海南省人民政府政策文件",
+    "url": "https://www.hainan.gov.cn/newsearch/",
+    "source_level": "省级",
+    "source_org": "海南省人民政府",
+    "enabled": true
+  },
+  {
+    "name": "海南自由贸易港政策文件汇编",
+    "url": "https://wjk.hnftp.gov.cn/",
+    "source_level": "自贸港",
+    "source_org": "海南自由贸易港官方网站",
+    "enabled": true
+  },
+  {
+    "name": "三亚市自然资源和规划局政策解读栏目",
+    "url": "https://zgj.sanya.gov.cn/zgjsite/zcjd/list2.shtml",
+    "source_level": "三亚本地",
+    "source_org": "三亚市自然资源和规划局",
+    "enabled": true
+  }
+]
